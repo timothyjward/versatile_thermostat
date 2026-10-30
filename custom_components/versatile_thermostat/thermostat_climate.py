@@ -164,6 +164,32 @@ class ThermostatOverClimate(BaseThermostat[UnderlyingClimate]):
         else:
             self._attr_hvac_action = HVACAction.OFF
 
+    @property
+    def _setpoint_modifiers(self) -> list:
+        """The configured external feature managers which adjust the regulated temperature"""
+        return [manager for manager in self._external_managers if manager.is_configured and hasattr(manager, "adjust_regulated_temperature")]
+
+    def _adjust_regulated_temperature(self, regulated_temp: float, regulation_step: float, command_cause: str | None) -> float:
+        """Let the external feature managers adjust the regulated temperature before it is sent.
+        A faulty plugin must not break the regulation, so its error is logged and its result ignored."""
+        for manager in self._setpoint_modifiers:
+            try:
+                adjusted_temp = manager.adjust_regulated_temperature(regulated_temp, regulation_step, command_cause)
+            except Exception as exc:  # pylint: disable=broad-except
+                _LOGGER.error("%s - Error while adjusting the regulated temperature with external feature manager '%s': %s", self, manager.name, exc)
+                continue
+            if adjusted_temp is not None:
+                regulated_temp = adjusted_temp
+        return regulated_temp
+
+    @overrides
+    async def _before_underlying_hvac_mode_change(self, _command_cause: str | None = None):
+        """Send the regulated temperature first when a plugin adjusts it, so that the device does not start at its own stored setpoint"""
+        if _command_cause == COMMAND_CAUSE_UNDERLYING_TRACKING or not self._setpoint_modifiers:
+            return
+        if self.vtherm_hvac_mode in (VThermHvacMode_HEAT, VThermHvacMode_COOL):
+            await self._send_regulated_temperature(force=True, _command_cause=_command_cause)
+
     async def _send_regulated_temperature(self, force=False, _command_cause: str | None = None):
         """Sends the regulated temperature to all underlying"""
 
@@ -247,6 +273,8 @@ class ThermostatOverClimate(BaseThermostat[UnderlyingClimate]):
             )
         else:
             new_regulated_temp = self.target_temperature
+
+        new_regulated_temp = self._adjust_regulated_temperature(new_regulated_temp, regulation_step, _command_cause)
 
         _LOGGER.info(
             "%s - Regulated temp have changed to %.1f. Resend it to underlyings",
